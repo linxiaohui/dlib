@@ -221,13 +221,13 @@ def read_entire_file(fname):
     return open(os.path.join(fname)).read()
 
 setup(
-    name='dlib',
+    name='dlib-binary',
     version=read_version_from_cmakelists('dlib/CMakeLists.txt'),
     description='A toolkit for making real world machine learning and data analysis applications',
     long_description='See http://dlib.net for documentation.',
-    author='Davis King',
-    author_email='davis@dlib.net',
-    url='https://github.com/davisking/dlib',
+    author='Lin Xiao Hui',
+    author_email='llinxiaohui@126.com',
+    url='https://github.com/linxiaohui/dlib',
     license='Boost Software License',
     ext_modules=[CMakeExtension('_dlib_pybind11','tools/python')],
     cmdclass=dict(build_ext=CMakeBuild, test=PyTest),

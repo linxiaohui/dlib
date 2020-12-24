@@ -6,6 +6,7 @@
 #include "loss_abstract.h"
 #include "core.h"
 #include "utilities.h"
+#include "misc.h"
 #include "../matrix.h"
 #include "../cuda/tensor_tools.h"
 #include "../geometry.h"
@@ -241,13 +242,6 @@ namespace dlib
 
     };
 
-    template <typename T>
-    T safe_log(T input, T epsilon = 1e-10)
-    {
-        // Prevent trying to calculate the logarithm of a very small number (let alone zero)
-        return std::log(std::max(input, epsilon));
-    }
-
     template <typename SUBNET>
     using loss_binary_log = add_loss_layer<loss_binary_log_, SUBNET>;
 
@@ -367,22 +361,6 @@ namespace dlib
 
     template <typename SUBNET>
     using loss_multiclass_log = add_loss_layer<loss_multiclass_log_, SUBNET>;
-
-// ----------------------------------------------------------------------------------------
-
-    template <typename label_type>
-    struct weighted_label
-    {
-        weighted_label()
-        {}
-
-        weighted_label(label_type label, float weight = 1.f)
-            : label(label), weight(weight)
-        {}
-
-        label_type label{};
-        float weight = 1.f;
-    };
 
 // ----------------------------------------------------------------------------------------
 
@@ -963,6 +941,9 @@ namespace dlib
         test_box_overlap overlaps_ignore;
         bool use_bounding_box_regression = false; 
         double bbr_lambda = 100; 
+        // This field is intentionally not serialized because I want people to really think hard
+        // about ignoring the warnings that this suppresses.
+        bool be_quiet = false;
 
         use_image_pyramid assume_image_pyramid = use_image_pyramid::yes;
 
@@ -1454,10 +1435,13 @@ namespace dlib
                         const auto i = idx_to_truth_rect.find(idx);
                         if (i != idx_to_truth_rect.end())
                         {
-                            // Ignore duplicate truth box in feature coordinates.
-                            std::cout << "Warning, ignoring object.  We encountered a truth rectangle located at " << x.rect;
-                            std::cout << ", and we are ignoring it because it maps to the exact same feature coordinates ";
-                            std::cout << "as another truth rectangle located at " << i->second << "." << std::endl;
+                            if (!options.be_quiet) 
+                            {
+                                // Ignore duplicate truth box in feature coordinates.
+                                std::cout << "Warning, ignoring object.  We encountered a truth rectangle located at " << x.rect;
+                                std::cout << ", and we are ignoring it because it maps to the exact same feature coordinates ";
+                                std::cout << "as another truth rectangle located at " << i->second << "." << std::endl;
+                            }
 
                             loss -= options.loss_per_missed_target;
                             truth_idxs.push_back(-1);
@@ -1537,11 +1521,14 @@ namespace dlib
                                 // added for it in the code above.
                                 loss -= options.loss_per_missed_target-out_data[idx];
                                 g[idx] = 0;
-                                std::cout << "Warning, ignoring object.  We encountered a truth rectangle located at " << (*truth)[i].rect;
-                                std::cout << " that is suppressed by non-max-suppression ";
-                                std::cout << "because it is overlapped by another truth rectangle located at " << best_matching_truth_box 
-                                          << " (IoU:"<< box_intersection_over_union(best_matching_truth_box,(*truth)[i]) <<", Percent covered:" 
-                                          << box_percent_covered(best_matching_truth_box,(*truth)[i]) << ")." << std::endl;
+                                if (!options.be_quiet) 
+                                {
+                                    std::cout << "Warning, ignoring object.  We encountered a truth rectangle located at " << (*truth)[i].rect;
+                                    std::cout << " that is suppressed by non-max-suppression ";
+                                    std::cout << "because it is overlapped by another truth rectangle located at " << best_matching_truth_box 
+                                        << " (IoU:"<< box_intersection_over_union(best_matching_truth_box,(*truth)[i]) <<", Percent covered:" 
+                                        << box_percent_covered(best_matching_truth_box,(*truth)[i]) << ")." << std::endl;
+                                }
                             }
                         }
                     }
@@ -2774,7 +2761,7 @@ namespace dlib
                 {
                     for (long c = 0; c < output_tensor.nc(); ++c) 
                     {
-                        iter->operator()(r, c) = out_data[tensor_index(output_tensor, i, r, c)];
+                        iter->operator()(r, c) = out_data[tensor_index(output_tensor, i, 0, r, c)];
                     }
                 }
             }
@@ -2811,49 +2798,13 @@ namespace dlib
                              "output size = " << output_tensor.nr() << " x " << output_tensor.nc());
             }
 
-#ifdef DLIB_USE_CUDA
             double loss;
+#ifdef DLIB_USE_CUDA
             cuda_compute(truth, output_tensor, grad, loss);
-            return loss;
 #else
-
-            tt::sigmoid(grad, output_tensor);
-
-            // The loss we output is the average loss over the mini-batch, and also over each element of the matrix output.
-            const double scale = 1.0/(output_tensor.num_samples()*output_tensor.nr()*output_tensor.nc());
-            double loss = 0;
-            float* const g = grad.host();
-            const float* const out_data = output_tensor.host();
-            for (long i = 0; i < output_tensor.num_samples(); ++i, ++truth)
-            {
-                for (long r = 0; r < output_tensor.nr(); ++r)
-                {
-                    for (long c = 0; c < output_tensor.nc(); ++c)
-                    {
-                        const float y = truth->operator()(r, c);
-                        const size_t idx = tensor_index(output_tensor, i, r, c);
-
-                        if (y > 0.f)
-                        {
-                            const float temp = log1pexp(-out_data[idx]);
-                            loss += y*scale*temp;
-                            g[idx] = y*scale*(g[idx]-1);
-                        }
-                        else if (y < 0.f)
-                        {
-                            const float temp = -(-out_data[idx]-log1pexp(-out_data[idx]));
-                            loss += -y*scale*temp;
-                            g[idx] = -y*scale*g[idx];
-                        }
-                        else
-                        {
-                            g[idx] = 0.f;
-                        }
-                    }
-                }
-            }
-            return loss;
+            cpu_compute(truth, output_tensor, grad, loss);
 #endif
+            return loss;
         }
 
         friend void serialize(const loss_binary_log_per_pixel_& , std::ostream& out)
@@ -2881,16 +2832,11 @@ namespace dlib
         }
 
     private:
-        static size_t tensor_index(const tensor& t, long sample, long row, long column)
-        {
-            DLIB_ASSERT(t.k() == 1);
-
-            // See: https://github.com/davisking/dlib/blob/4dfeb7e186dd1bf6ac91273509f687293bd4230a/dlib/dnn/tensor_abstract.h#L38
-            return (sample * t.nr() + row) * t.nc() + column;
-        }
 
 #ifdef DLIB_USE_CUDA
         cuda::compute_loss_binary_log_per_pixel cuda_compute;
+#else
+        cpu::compute_loss_binary_log_per_pixel cpu_compute;
 #endif
     };
 
@@ -2997,51 +2943,13 @@ namespace dlib
             }
 
 
-#ifdef DLIB_USE_CUDA
             double loss;
+#ifdef DLIB_USE_CUDA
             cuda_compute(truth, output_tensor, grad, loss);
-            return loss;
 #else
-
-            tt::softmax(grad, output_tensor);
-
-            // The loss we output is the average loss over the mini-batch, and also over each element of the matrix output.
-            const double scale = 1.0 / (output_tensor.num_samples() * output_tensor.nr() * output_tensor.nc());
-            double loss = 0;
-            float* const g = grad.host();
-            for (long i = 0; i < output_tensor.num_samples(); ++i, ++truth)
-            {
-                for (long r = 0; r < output_tensor.nr(); ++r)
-                {
-                    for (long c = 0; c < output_tensor.nc(); ++c)
-                    {
-                        const uint16_t y = truth->operator()(r, c);
-                        // The network must produce a number of outputs that is equal to the number
-                        // of labels when using this type of loss.
-                        DLIB_CASSERT(static_cast<long>(y) < output_tensor.k() || y == label_to_ignore,
-                                        "y: " << y << ", output_tensor.k(): " << output_tensor.k());
-                        for (long k = 0; k < output_tensor.k(); ++k)
-                        {
-                            const size_t idx = tensor_index(output_tensor, i, k, r, c);
-                            if (k == y)
-                            {
-                                loss += scale*-safe_log(g[idx]);
-                                g[idx] = scale*(g[idx] - 1);
-                            }
-                            else if (y == label_to_ignore)
-                            {
-                                g[idx] = 0.f;
-                            }
-                            else
-                            {
-                                g[idx] = scale*g[idx];
-                            }
-                        }
-                    }
-                }
-            }
-            return loss;
+            cpu_compute(truth, output_tensor, grad, loss);
 #endif
+            return loss;
         }
 
         friend void serialize(const loss_multiclass_log_per_pixel_& , std::ostream& out)
@@ -3069,15 +2977,11 @@ namespace dlib
         }
 
     private:
-        static size_t tensor_index(const tensor& t, long sample, long k, long row, long column)
-        {
-            // See: https://github.com/davisking/dlib/blob/4dfeb7e186dd1bf6ac91273509f687293bd4230a/dlib/dnn/tensor_abstract.h#L38
-            return ((sample * t.k() + k) * t.nr() + row) * t.nc() + column;
-        }
-
 
 #ifdef DLIB_USE_CUDA
         cuda::compute_loss_multiclass_log_per_pixel cuda_compute;
+#else
+        cpu::compute_loss_multiclass_log_per_pixel cpu_compute;
 #endif
     };
 
@@ -3139,41 +3043,12 @@ namespace dlib
                              "output size = " << output_tensor.nr() << " x " << output_tensor.nc());
             }
 
-            tt::softmax(grad, output_tensor);
-
-            // The loss we output is the weighted average loss over the mini-batch, and also over each element of the matrix output.
-            const double scale = 1.0 / (output_tensor.num_samples() * output_tensor.nr() * output_tensor.nc());
-            double loss = 0;
-            float* const g = grad.host();
-            for (long i = 0; i < output_tensor.num_samples(); ++i, ++truth)
-            {
-                for (long r = 0; r < output_tensor.nr(); ++r)
-                {
-                    for (long c = 0; c < output_tensor.nc(); ++c)
-                    {
-                        const weighted_label& weighted_label = truth->operator()(r, c);
-                        const uint16_t y = weighted_label.label;
-                        const float weight = weighted_label.weight;
-                        // The network must produce a number of outputs that is equal to the number
-                        // of labels when using this type of loss.
-                        DLIB_CASSERT(static_cast<long>(y) < output_tensor.k() || weight == 0.f,
-                                        "y: " << y << ", output_tensor.k(): " << output_tensor.k());
-                        for (long k = 0; k < output_tensor.k(); ++k)
-                        {
-                            const size_t idx = tensor_index(output_tensor, i, k, r, c);
-                            if (k == y)
-                            {
-                                loss += weight*scale*-safe_log(g[idx]);
-                                g[idx] = weight*scale*(g[idx] - 1);
-                            }
-                            else
-                            {
-                                g[idx] = weight*scale*g[idx];
-                            }
-                        }
-                    }
-                }
-            }
+            double loss;
+#ifdef DLIB_USE_CUDA
+            cuda_compute(truth, output_tensor, grad, loss);
+#else
+            cpu_compute(truth, output_tensor, grad, loss);
+#endif
             return loss;
         }
 
@@ -3202,11 +3077,12 @@ namespace dlib
         }
 
     private:
-        static size_t tensor_index(const tensor& t, long sample, long k, long row, long column)
-        {
-            // See: https://github.com/davisking/dlib/blob/4dfeb7e186dd1bf6ac91273509f687293bd4230a/dlib/dnn/tensor_abstract.h#L38
-            return ((sample * t.k() + k) * t.nr() + row) * t.nc() + column;
-        }
+
+#ifdef DLIB_USE_CUDA
+        cuda::compute_loss_multiclass_log_per_pixel_weighted cuda_compute;
+#else
+        cpu::compute_loss_multiclass_log_per_pixel_weighted cpu_compute;
+#endif
 
     };
 
@@ -3333,12 +3209,6 @@ namespace dlib
             out << "<loss_mean_squared_per_pixel/>";
         }
 
-    private:
-        static size_t tensor_index(const tensor& t, long sample, long k, long row, long column)
-        {
-            // See: https://github.com/davisking/dlib/blob/4dfeb7e186dd1bf6ac91273509f687293bd4230a/dlib/dnn/tensor_abstract.h#L38
-            return ((sample * t.k() + k) * t.nr() + row) * t.nc() + column;
-        }
     };
 
     template <typename SUBNET>
@@ -3458,11 +3328,7 @@ namespace dlib
         }
 
     private:
-        static size_t tensor_index(const tensor& t, long sample, long k, long row, long column)
-        {
-            // See: https://github.com/davisking/dlib/blob/4dfeb7e186dd1bf6ac91273509f687293bd4230a/dlib/dnn/tensor_abstract.h#L38
-            return ((sample * t.k() + k) * t.nr() + row) * t.nc() + column;
-        }
+
 #ifdef DLIB_USE_CUDA
         cuda::compute_loss_mean_squared_per_channel_and_pixel cuda_compute;
 #else

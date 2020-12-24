@@ -13,23 +13,6 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
-    inline double log1pexp(double x)
-    {
-        using std::exp;
-        using namespace std; // Do this instead of using std::log1p because some compilers
-                             // error out otherwise (E.g. gcc 4.9 in cygwin)
-        if (x <= -37)
-            return exp(x);
-        else if (-37 < x && x <= 18)
-            return log1p(exp(x));
-        else if (18 < x && x <= 33.3)
-            return x + exp(-x);
-        else
-            return x;
-    }
-    
-// ----------------------------------------------------------------------------------------
-
     inline void randomize_parameters (
         tensor& params,
         unsigned long num_inputs_and_outputs,
@@ -81,13 +64,13 @@ namespace dlib
             }
 
             template <unsigned long ID, typename U, typename E>
-            void operator()(size_t idx, const add_tag_layer<ID,U,E>& l) 
+            void operator()(size_t idx, const add_tag_layer<ID,U,E>& /*l*/) 
             {
                 out << "<layer idx='"<<idx<<"' type='tag' id='"<<ID<<"'/>\n";
             }
 
             template <template<typename> class T, typename U>
-            void operator()(size_t idx, const add_skip_layer<T,U>& l) 
+            void operator()(size_t idx, const add_skip_layer<T,U>& /*l*/) 
             {
                 out << "<layer idx='"<<idx<<"' type='skip' id='"<<(tag_id<T>::id)<<"'/>\n";
             }
